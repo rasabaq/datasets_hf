@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Bar Chart Race (D3) - HF Boss</title>
+  <style>
+    :root { --sans: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji"; }
+    body { font-family: var(--sans); margin: 24px; color: #111; }
+    .wrap { max-width: 1100px; margin: 0 auto; }
+    .controls { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom: 14px; }
+    .controls button { padding: 8px 12px; border: 1px solid #ddd; background:#fff; border-radius: 10px; cursor:pointer; }
+    .controls button:hover { background:#f7f7f7; }
+    .hint { font-size: 13px; color:#555; margin-top: 8px; line-height: 1.35; }
+    #chart { border: 1px solid #eee; border-radius: 16px; padding: 12px; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="controls">
+    <button id="replayBtn">Replay</button>
+  </div>
+
+  <div id="chart"></div>
+
+  <div class="hint">
+    Se carga <code>Datasets/hf_boss.csv</code> y se muestra el conteo acumulado de datasets por <code>task</code>.
+    Si no est&aacute; disponible, se mostrar&aacute; un mensaje de error.
+  </div>
+</div>
+
+<!-- D3 v7 -->
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script>
+(() => {
+  const defaultCsvPath = "Datasets/hf_boss.csv";
+
+  const elChart = document.getElementById("chart");
+  const replayBtn = document.getElementById("replayBtn");
+
+  let stop = { now: false };
+  let currentData = [];
+
+  replayBtn.addEventListener("click", () => run(currentData));
+
+  // Carga inicial del CSV de HF Boss
+  loadBossCsv()
+    .then(data => {
+      currentData = data;
+      run(currentData);
+    })
+    .catch(err => {
+      console.warn("No se pudo cargar hf_boss.csv", err);
+      elChart.innerHTML = "<p>No se pudo cargar Datasets/hf_boss.csv.</p>";
+    });
+
+  function parseCsv(text) {
+    const rows = d3.csvParse(text.trim());
+    if (!rows.length) throw new Error("CSV vacio");
+
+    const isBoss = "created_at" in rows[0] || rows.columns.includes("created_at");
+    const parsed = rows.map((d) => {
+      const dateStr = isBoss ? d.created_at : d.date;
+      const normalizedDate = dateStr ? String(dateStr).replace(" ", "T") : undefined;
+      const date = normalizedDate ? new Date(normalizedDate) : undefined;
+      const name = (isBoss ? (d.id || d.author) : d.name)?.trim();
+      const category = (isBoss ? (d.task || d.category) : d.category)?.trim() || undefined;
+
+      const rawValue = isBoss
+        ? (d.downloads_all_time ?? d.downloads ?? d.likes)
+        : d.value;
+      const value = rawValue === undefined ? NaN : +rawValue;
+
+      return { date, name, category, value };
+    }).filter(d => d.date && !isNaN(+d.date) && d.name && isFinite(d.value));
+
+    if (!parsed.length) throw new Error("No se encontraron filas validas");
+    return parsed;
+  }
+
+  function getWidth() {
+    const w = elChart.getBoundingClientRect().width;
+    return Math.max(640, Math.floor(w)); // minimo comodo
+  }
+
+  async function run(data) {
+    if (!data.length) {
+      elChart.innerHTML = "<p>No hay datos para mostrar.</p>";
+      return;
+    }
+
+    // Cancelar corrida anterior
+    stop.now = true;
+    stop = { now: false };
+
+    // Limpia
+    elChart.innerHTML = "";
+
+    // === Config ===
+    const n = 8;              // top N (más liviano)
+    const k = 3;              // menos interpolación para aligerar
+    const duration = 140;     // ms por frame
+    const marginTop = 16;
+    const marginRight = 6;
+    const marginBottom = 6;
+    const marginLeft = 0;
+    const barSize = 40;
+
+    const width = getWidth();
+    const height = marginTop + barSize * n + marginBottom;
+
+    const formatNumber = d3.format(",d");
+    const formatDate = d3.utcFormat("%Y-%m");
+
+    const aggregated = buildCountsByTask(data);
+    const keyframes = computeKeyframes(aggregated, k, n);
+
+    const nameframes = d3.groups(keyframes.flatMap(([, d]) => d), d => d.name);
+    const prev = new Map(nameframes.flatMap(([, d]) => d3.pairs(d, (a, b) => [b, a])));
+    const next = new Map(nameframes.flatMap(([, d]) => d3.pairs(d)));
+
+    const x = d3.scaleLinear().domain([0, 1]).range([marginLeft, width - marginRight]);
+    const y = d3.scaleBand()
+      .domain(d3.range(n + 1))
+      .rangeRound([marginTop, marginTop + barSize * (n + 1 + 0.1)])
+      .padding(0.1);
+
+    // Color: si existe category (task), colorea por ella; si no, por nombre
+    const scale = d3.scaleOrdinal(d3.schemeTableau10);
+    let color = (d) => scale(d.name);
+    if (data.some(d => d.category !== undefined)) {
+      const categoryByName = new Map(data.map(d => [d.name, d.category]));
+      scale.domain(new Set(categoryByName.values()));
+      color = (d) => scale(categoryByName.get(d.name));
+    }
+
+    const svg = d3.create("svg")
+      .attr("viewBox", [0, 0, width, height])
+      .attr("width", width)
+      .attr("height", height)
+      .style("max-width", "100%")
+      .style("height", "auto");
+
+    elChart.appendChild(svg.node());
+
+    const updateBars = bars(svg, x, y, n, color, prev, next);
+    const updateAxis = axis(svg, x, y, width, barSize, n, marginTop);
+    const updateLabels = labels(svg, x, y, n, prev, next, formatNumber);
+    const updateTicker = ticker(svg, width, barSize, n, marginTop, formatDate, keyframes[0][0]);
+
+    for (const keyframe of keyframes) {
+      if (stop.now) break;
+
+      const t = svg.transition().duration(duration).ease(d3.easeLinear);
+
+      x.domain([0, keyframe[1][0].value || 1]);
+
+      updateAxis(keyframe, t);
+      updateBars(keyframe, t);
+      updateLabels(keyframe, t);
+      updateTicker(keyframe, t);
+
+      try {
+        await t.end();
+      } catch (_) {
+        // Interrumpido
+        break;
+      }
+    }
+  }
+
+  // === Componentes (joins + transitions) ===
+  function bars(svg, x, y, n, color, prev, next) {
+    let bar = svg.append("g")
+      .attr("fill-opacity", 0.6)
+      .selectAll("rect");
+
+    return ([, data], transition) => bar = bar
+      .data(data.slice(0, n), d => d.name)
+      .join(
+        enter => enter.append("rect")
+          .attr("fill", color)
+          .attr("height", y.bandwidth())
+          .attr("x", x(0))
+          .attr("y", d => y((prev.get(d) || d).rank))
+          .attr("width", d => x((prev.get(d) || d).value) - x(0)),
+        update => update,
+        exit => exit.transition(transition).remove()
+          .attr("y", d => y((next.get(d) || d).rank))
+          .attr("width", d => x((next.get(d) || d).value) - x(0))
+      )
+      .call(bar => bar.transition(transition)
+        .attr("y", d => y(d.rank))
+        .attr("width", d => x(d.value) - x(0)));
+  }
+
+  function labels(svg, x, y, n, prev, next, formatNumber) {
+    let label = svg.append("g")
+      .style("font", "bold 12px var(--sans)")
+      .style("font-variant-numeric", "tabular-nums")
+      .attr("text-anchor", "end")
+      .selectAll("text");
+
+    return ([, data], transition) => label = label
+      .data(data.slice(0, n), d => d.name)
+      .join(
+        enter => {
+          const g = enter.append("text")
+            .attr("transform", d => `translate(${x((prev.get(d) || d).value)},${y((prev.get(d) || d).rank)})`)
+            .attr("y", y.bandwidth() / 2)
+            .attr("x", -6)
+            .attr("dy", "-0.25em")
+            .text(d => d.name);
+
+          g.append("tspan")
+            .attr("fill-opacity", 0.7)
+            .attr("font-weight", "normal")
+            .attr("x", -6)
+            .attr("dy", "1.15em");
+
+          return g;
+        },
+        update => update,
+        exit => exit.transition(transition).remove()
+          .attr("transform", d => `translate(${x((next.get(d) || d).value)},${y((next.get(d) || d).rank)})`)
+          .call(g => g.select("tspan").tween("text", d => textTween(d.value, (next.get(d) || d).value, formatNumber)))
+      )
+      .call(g => g.transition(transition)
+        .attr("transform", d => `translate(${x(d.value)},${y(d.rank)})`)
+        .call(g => g.select("tspan").tween("text", d => textTween((prev.get(d) || d).value, d.value, formatNumber))));
+  }
+
+  function textTween(a, b, formatNumber) {
+    const i = d3.interpolateNumber(a, b);
+    return function(t) { this.textContent = formatNumber(i(t)); };
+  }
+
+  function axis(svg, x, y, width, barSize, n, marginTop) {
+    const g = svg.append("g").attr("transform", `translate(0,${marginTop})`);
+    const axis = d3.axisTop(x)
+      .ticks(width / 220)
+      .tickSizeOuter(0)
+      .tickSizeInner(-barSize * (n + y.padding()));
+
+    return (_, transition) => {
+      g.transition(transition).call(axis);
+      g.select(".tick:first-of-type text").remove();
+      g.selectAll(".tick:not(:first-of-type) line").attr("stroke", "white");
+      g.select(".domain").remove();
+    };
+  }
+
+  function ticker(svg, width, barSize, n, marginTop, formatDate, startDate) {
+    const now = svg.append("text")
+      .style("font", `bold ${barSize}px var(--sans)`)
+      .style("font-variant-numeric", "tabular-nums")
+      .attr("text-anchor", "end")
+      .attr("x", width - 6)
+      .attr("y", marginTop + barSize * (n - 0.45))
+      .attr("dy", "0.32em")
+      .text(formatDate(startDate));
+
+    return ([date], transition) => {
+      transition.end().then(() => now.text(formatDate(date)));
+    };
+  }
+
+  // === Keyframes (interpolacion) ===
+  function computeKeyframes(data, k, n) {
+    const sorted = [...data].sort((a, b) => d3.ascending(a.date, b.date));
+    const names = new Set(sorted.map(d => d.name));
+
+    // Acumula valores para que cada dataset permanezca visible despues de su fecha de creacion
+    const grouped = d3.groups(sorted, d => +d.date)
+      .map(([ts, rows]) => [new Date(+ts), rows])
+      .sort(([a], [b]) => d3.ascending(a, b));
+
+    let latest = new Map();
+    const datevalues = [];
+
+    for (const [date, rows] of grouped) {
+      latest = new Map(latest);
+      for (const row of rows) latest.set(row.name, row.value);
+      datevalues.push([date, latest]);
+    }
+
+    const rank = (value) => {
+      const arr = Array.from(names, (name) => ({ name, value: value(name) || 0 }));
+      arr.sort((a, b) => d3.descending(a.value, b.value));
+      for (let i = 0; i < arr.length; ++i) arr[i].rank = Math.min(n, i);
+      return arr;
+    };
+
+    let keyframes = [];
+    let ka, a, kb, b;
+
+    for ([[ka, a], [kb, b]] of d3.pairs(datevalues)) {
+      for (let i = 0; i < k; ++i) {
+        const t = i / k;
+        keyframes.push([
+          new Date(+ka * (1 - t) + +kb * t),
+          rank((name) => (a.get(name) || 0) * (1 - t) + (b.get(name) || 0) * t)
+        ]);
+      }
+    }
+
+    const [lastDate, lastMap] = datevalues[datevalues.length - 1];
+    keyframes.push([new Date(lastDate), rank((name) => lastMap.get(name) || 0)]);
+    return keyframes;
+  }
+
+  async function loadBossCsv() {
+    const text = await d3.text(defaultCsvPath);
+    return parseCsv(text);
+  }
+
+  // Construye un arreglo con conteo acumulado por task (category)
+  function buildCountsByTask(data) {
+    const filtered = data.filter(d => d.category);
+    const sorted = [...filtered].sort((a, b) => d3.ascending(a.date, b.date));
+    const counts = new Map();
+    const out = [];
+    for (const row of sorted) {
+      const task = row.category;
+      counts.set(task, (counts.get(task) || 0) + 1);
+      out.push({
+        date: row.date,
+        name: task,
+        category: task,
+        value: counts.get(task)
+      });
+    }
+    return out;
+  }
+
+  // Primera corrida
+})();
+</script>
+</body>
+</html>
